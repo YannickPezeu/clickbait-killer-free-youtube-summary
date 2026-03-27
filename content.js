@@ -140,13 +140,13 @@
   };
 
   function t(key) {
-    const lang = document.getElementById("yts-language")?.value || "français";
-    return i18n[lang]?.[key] || i18n["français"][key];
+    const lang = document.getElementById("yts-language")?.value || "English";
+    return i18n[lang]?.[key] || i18n["English"][key];
   }
 
   function updateUI() {
-    const lang = document.getElementById("yts-language")?.value || "français";
-    const strings = i18n[lang] || i18n["français"];
+    const lang = document.getElementById("yts-language")?.value || "English";
+    const strings = i18n[lang] || i18n["English"];
 
     const labelLang = document.querySelector(`#${PANEL_ID} label[for="yts-language"]`);
     const labelMode = document.querySelector(`#${PANEL_ID} label[for="yts-mode"]`);
@@ -260,8 +260,8 @@
         <div class="yts-row">
           <label for="yts-language">Langue :</label>
           <select id="yts-language">
-            <option value="français">Français</option>
             <option value="English">English</option>
+            <option value="français">Français</option>
             <option value="español">Español</option>
             <option value="Deutsch">Deutsch</option>
             <option value="italiano">Italiano</option>
