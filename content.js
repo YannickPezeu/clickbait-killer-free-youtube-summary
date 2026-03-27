@@ -372,7 +372,6 @@
           if (msg.chunk) {
             fullText += msg.chunk;
             resultDiv.innerHTML = formatSummary(fullText);
-            resultDiv.scrollTop = resultDiv.scrollHeight;
           }
           if (msg.done) {
             resolve();
