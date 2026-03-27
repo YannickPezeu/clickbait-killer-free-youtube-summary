@@ -8,58 +8,93 @@
 async function fetchTranscriptFromUrl(baseUrl) {
   let lines = [];
 
-  // Try json3 format
+  // Fetch the URL and parse whatever format comes back (JSON or XML)
   try {
+    // Try with json3 format hint
     const url = baseUrl.includes("fmt=")
       ? baseUrl
       : baseUrl + "&fmt=json3";
     const res = await fetch(url, { credentials: "include" });
-    console.log("[YT-Summary][MAIN] json3 status:", res.status);
+    console.log("[YT-Summary][MAIN] fetch status:", res.status);
     if (res.ok) {
       const text = await res.text();
-      console.log("[YT-Summary][MAIN] json3 body length:", text.length);
+      console.log("[YT-Summary][MAIN] fetch body length:", text.length);
       if (text.length > 0) {
-        const data = JSON.parse(text);
-        lines = (data.events || [])
-          .filter((e) => e.segs)
-          .map((e) => e.segs.map((s) => s.utf8).join(""))
-          .filter((l) => l.trim());
+        lines = parseTranscriptResponse(text);
       }
     }
   } catch (e) {
-    console.log("[YT-Summary][MAIN] json3 error:", e.message);
+    console.log("[YT-Summary][MAIN] fetch error:", e.message);
   }
 
-  if (lines.length) return lines;
-
-  // Fallback: raw XML (classic <text> format)
-  try {
-    const res = await fetch(baseUrl, { credentials: "include" });
-    console.log("[YT-Summary][MAIN] XML status:", res.status);
-    const xml = await res.text();
-    console.log("[YT-Summary][MAIN] XML body length:", xml.length);
-    if (xml.length > 0) {
-      // Handle both classic <text> and srv3 <p><s> formats
-      const classicRegex = /<text[^>]*>([\s\S]*?)<\/text>/g;
-      let match;
-      while ((match = classicRegex.exec(xml)) !== null) {
-        const decoded = decodeXmlEntities(match[1]).replace(/\n/g, " ").trim();
-        if (decoded) lines.push(decoded);
-      }
-
-      // srv3 format: <p t="..." d="..."><s>text</s></p>
-      if (!lines.length) {
-        const srv3Regex = /<s[^>]*>([\s\S]*?)<\/s>/g;
-        while ((match = srv3Regex.exec(xml)) !== null) {
-          const decoded = decodeXmlEntities(match[1]).trim();
-          if (decoded) lines.push(decoded);
+  // If json3 param changed the URL and returned empty, try original URL
+  if (!lines.length && !baseUrl.includes("fmt=")) {
+    try {
+      const res = await fetch(baseUrl, { credentials: "include" });
+      if (res.ok) {
+        const text = await res.text();
+        console.log("[YT-Summary][MAIN] fallback body length:", text.length);
+        if (text.length > 0) {
+          lines = parseTranscriptResponse(text);
         }
       }
+    } catch (e) {
+      console.log("[YT-Summary][MAIN] fallback error:", e.message);
     }
-  } catch (e) {
-    console.log("[YT-Summary][MAIN] XML error:", e.message);
   }
 
+  return lines;
+}
+
+/**
+ * Parse a transcript response that could be JSON (json3) or XML.
+ */
+function parseTranscriptResponse(text) {
+  const trimmed = text.trim();
+
+  // Try JSON first
+  if (trimmed.startsWith("{")) {
+    try {
+      const data = JSON.parse(trimmed);
+      const lines = (data.events || [])
+        .filter((e) => e.segs)
+        .map((e) => e.segs.map((s) => s.utf8).join(""))
+        .filter((l) => l.trim());
+      if (lines.length) return lines;
+    } catch {}
+  }
+
+  // Parse as XML
+  let lines = [];
+  let match;
+
+  // Classic <text> format
+  const classicRegex = /<text[^>]*>([\s\S]*?)<\/text>/g;
+  while ((match = classicRegex.exec(trimmed)) !== null) {
+    const decoded = decodeXmlEntities(match[1]).replace(/\n/g, " ").trim();
+    if (decoded) lines.push(decoded);
+  }
+
+  // srv3 <body><p><s> format
+  if (!lines.length) {
+    const srv3Regex = /<s[^>]*>([\s\S]*?)<\/s>/g;
+    while ((match = srv3Regex.exec(trimmed)) !== null) {
+      const decoded = decodeXmlEntities(match[1]).trim();
+      if (decoded) lines.push(decoded);
+    }
+  }
+
+  // srv3 <body><p> format (no <s> wrapper)
+  if (!lines.length) {
+    const pRegex = /<p[^>]+>([\s\S]*?)<\/p>/g;
+    while ((match = pRegex.exec(trimmed)) !== null) {
+      // Strip inner tags
+      const decoded = decodeXmlEntities(match[1].replace(/<[^>]+>/g, "")).trim();
+      if (decoded) lines.push(decoded);
+    }
+  }
+
+  console.log("[YT-Summary][MAIN] Parsed lines:", lines.length, trimmed.startsWith("{") ? "(json)" : "(xml)");
   return lines;
 }
 
@@ -146,6 +181,33 @@ async function getTracksFromInnertubeAPI(videoId) {
 }
 
 /**
+ * Encode video ID into the protobuf params format expected by get_transcript.
+ * Wire format: field 1 (string) containing a nested message with field 1 (string) = videoId
+ */
+function encodeTranscriptParams(videoId) {
+  // Inner message: field 1, wire type 2 (length-delimited), value = videoId
+  const innerField = new Uint8Array(2 + videoId.length);
+  innerField[0] = 0x0a; // field 1, wire type 2
+  innerField[1] = videoId.length;
+  for (let i = 0; i < videoId.length; i++) {
+    innerField[2 + i] = videoId.charCodeAt(i);
+  }
+
+  // Outer message: field 1, wire type 2, value = inner message
+  const outer = new Uint8Array(2 + innerField.length);
+  outer[0] = 0x0a; // field 1, wire type 2
+  outer[1] = innerField.length;
+  outer.set(innerField, 2);
+
+  // Base64 encode
+  let binary = "";
+  for (let i = 0; i < outer.length; i++) {
+    binary += String.fromCharCode(outer[i]);
+  }
+  return btoa(binary);
+}
+
+/**
  * Strategy 3: Use YouTube's InnerTube get_transcript endpoint.
  * This is what YouTube's own "Show transcript" UI uses internally.
  * It works with the WEB client and page cookies, bypassing POT issues.
@@ -176,7 +238,7 @@ async function getTranscriptFromInnertubeWeb(videoId) {
           clientVersion: "2.20250326.00.00",
         },
       },
-      params: btoa(`\n\x0b${videoId}`),
+      params: encodeTranscriptParams(videoId),
     }),
   });
 
