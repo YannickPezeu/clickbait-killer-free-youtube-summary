@@ -91,7 +91,6 @@ function pickTrack(tracks) {
 
 /**
  * Strategy 1: Use caption tracks already available in the page's player response.
- * This is the fastest path and works when baseUrls haven't expired / don't need POT.
  */
 function getTracksFromPageState() {
   let pr = window.ytInitialPlayerResponse;
@@ -108,20 +107,10 @@ function getTracksFromPageState() {
 
 /**
  * Strategy 2: Call YouTube's InnerTube player API with an ANDROID client context.
- *
- * This is how the popular `youtube-transcript` npm package and the Python
- * `youtube-transcript-api` library work. The ANDROID client returns baseUrls
- * that do NOT require a Proof-of-Origin (POT) token, which is the root cause
- * of 200-OK-but-empty-body responses from the timedtext endpoint since mid-2025.
- *
- * Reference:
- *   https://github.com/Kakulukian/youtube-transcript  (npm)
- *   https://github.com/jdepoix/youtube-transcript-api  (Python)
  */
 async function getTracksFromInnertubeAPI(videoId) {
-  console.log("[YT-Summary][MAIN] Falling back to InnerTube player API...");
+  console.log("[YT-Summary][MAIN] Trying InnerTube ANDROID API...");
 
-  // Try to grab the page's API key; if unavailable, omit it (endpoint works without it too)
   let apiKey = "";
   try {
     const cfg = window.ytcfg;
@@ -136,8 +125,6 @@ async function getTracksFromInnertubeAPI(videoId) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      // ANDROID client User-Agent — this is what makes the returned baseUrls
-      // work without a POT token.
       "User-Agent":
         "com.google.android.youtube/20.10.38 (Linux; U; Android 14)",
     },
@@ -152,14 +139,76 @@ async function getTracksFromInnertubeAPI(videoId) {
     }),
   });
 
-  if (!res.ok) {
-    throw new Error(`InnerTube API returned ${res.status}`);
-  }
+  if (!res.ok) throw new Error(`InnerTube ANDROID returned ${res.status}`);
 
   const data = await res.json();
-  return (
-    data?.captions?.playerCaptionsTracklistRenderer?.captionTracks || null
-  );
+  return data?.captions?.playerCaptionsTracklistRenderer?.captionTracks || null;
+}
+
+/**
+ * Strategy 3: Use YouTube's InnerTube get_transcript endpoint.
+ * This is what YouTube's own "Show transcript" UI uses internally.
+ * It works with the WEB client and page cookies, bypassing POT issues.
+ */
+async function getTranscriptFromInnertubeWeb(videoId) {
+  console.log("[YT-Summary][MAIN] Trying InnerTube get_transcript (WEB)...");
+
+  let apiKey = "";
+  try {
+    const cfg = window.ytcfg;
+    apiKey = cfg?.get?.("INNERTUBE_API_KEY") || cfg?.data_?.INNERTUBE_API_KEY || "";
+  } catch (_) {}
+
+  if (!apiKey) {
+    throw new Error("No InnerTube API key available");
+  }
+
+  const url = `https://www.youtube.com/youtubei/v1/get_transcript?key=${apiKey}&prettyPrint=false`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      context: {
+        client: {
+          clientName: "WEB",
+          clientVersion: "2.20250326.00.00",
+        },
+      },
+      params: btoa(`\n\x0b${videoId}`),
+    }),
+  });
+
+  if (!res.ok) throw new Error(`get_transcript returned ${res.status}`);
+
+  const data = await res.json();
+
+  // Extract transcript segments from the response
+  const body =
+    data?.actions?.[0]?.updateEngagementPanelAction?.content
+      ?.transcriptRenderer?.body?.transcriptBodyRenderer?.cueGroups ||
+    data?.actions?.[0]?.updateEngagementPanelAction?.content
+      ?.transcriptRenderer?.content?.transcriptSearchPanelRenderer
+      ?.body?.transcriptSegmentListRenderer?.initialSegments;
+
+  if (!body?.length) {
+    throw new Error("No transcript segments in response");
+  }
+
+  const lines = body
+    .map((group) => {
+      const cue =
+        group?.transcriptCueGroupRenderer?.cues?.[0]
+          ?.transcriptCueRenderer?.cue?.simpleText ||
+        group?.transcriptSegmentRenderer?.snippet?.runs
+          ?.map((r) => r.text)
+          .join("");
+      return cue?.trim();
+    })
+    .filter(Boolean);
+
+  return lines;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,50 +224,44 @@ window.addEventListener("yts-get-transcript", async () => {
 
     let lines = [];
 
-    // -----------------------------------------------------------------------
-    // Strategy 1: Try the page-state baseUrl first (fastest, no extra request)
-    // -----------------------------------------------------------------------
+    // Strategy 1: Page-state baseUrl (fastest)
     const pageTracks = getTracksFromPageState();
-
     if (pageTracks?.length) {
       console.log("[YT-Summary][MAIN] Page tracks:", pageTracks.length);
       const track = pickTrack(pageTracks);
-      console.log(
-        "[YT-Summary][MAIN] Trying page-state track:",
-        track.languageCode
-      );
+      console.log("[YT-Summary][MAIN] Trying page-state track:", track.languageCode);
       lines = await fetchTranscriptFromUrl(track.baseUrl);
     }
 
-    // -----------------------------------------------------------------------
-    // Strategy 2: InnerTube ANDROID API (gets fresh URLs without POT requirement)
-    // This is the method used by youtube-transcript (npm) and youtube-transcript-api (Python).
-    // -----------------------------------------------------------------------
+    // Strategy 2: InnerTube ANDROID API
     if (!lines.length) {
-      console.log(
-        "[YT-Summary][MAIN] Page-state baseUrl returned empty — trying InnerTube API..."
-      );
+      console.log("[YT-Summary][MAIN] Page-state empty — trying InnerTube ANDROID...");
       try {
         const innerTracks = await getTracksFromInnertubeAPI(videoId);
         if (innerTracks?.length) {
           const track = pickTrack(innerTracks);
-          console.log(
-            "[YT-Summary][MAIN] InnerTube track:",
-            track.languageCode
-          );
+          console.log("[YT-Summary][MAIN] InnerTube ANDROID track:", track.languageCode);
           lines = await fetchTranscriptFromUrl(track.baseUrl);
         } else {
-          console.log("[YT-Summary][MAIN] InnerTube API returned no tracks.");
+          console.log("[YT-Summary][MAIN] InnerTube ANDROID returned no tracks.");
         }
       } catch (e) {
-        console.log("[YT-Summary][MAIN] InnerTube API error:", e.message);
+        console.log("[YT-Summary][MAIN] InnerTube ANDROID error:", e.message);
       }
     }
 
-    // -----------------------------------------------------------------------
-    // Strategy 3: Direct timedtext URL with video ID (last resort)
-    // Some older videos respond to this without POT.
-    // -----------------------------------------------------------------------
+    // Strategy 3: InnerTube get_transcript (WEB client with cookies)
+    if (!lines.length) {
+      console.log("[YT-Summary][MAIN] ANDROID empty — trying get_transcript WEB...");
+      try {
+        lines = await getTranscriptFromInnertubeWeb(videoId);
+        console.log("[YT-Summary][MAIN] get_transcript lines:", lines?.length);
+      } catch (e) {
+        console.log("[YT-Summary][MAIN] get_transcript error:", e.message);
+      }
+    }
+
+    // Strategy 4: Direct timedtext URL (last resort)
     if (!lines.length) {
       console.log("[YT-Summary][MAIN] Trying direct timedtext fallback...");
       try {
@@ -228,9 +271,7 @@ window.addEventListener("yts-get-transcript", async () => {
       } catch (_) {}
     }
 
-    // -----------------------------------------------------------------------
     // Dispatch result
-    // -----------------------------------------------------------------------
     console.log("[YT-Summary][MAIN] Total lines:", lines.length);
 
     if (lines.length > 0) {
@@ -244,8 +285,8 @@ window.addEventListener("yts-get-transcript", async () => {
         new CustomEvent("yts-transcript-result", {
           detail: JSON.stringify({
             error:
-              "Sous-titres vides — YouTube a peut-être bloqué la requête (POT token). " +
-              "Essayez de recharger la page ou vérifiez que la vidéo a des sous-titres.",
+              "No subtitles found — YouTube may have blocked the request. " +
+              "Try reloading the page or check that the video has subtitles.",
           }),
         })
       );
@@ -253,7 +294,7 @@ window.addEventListener("yts-get-transcript", async () => {
   } catch (e) {
     window.dispatchEvent(
       new CustomEvent("yts-transcript-result", {
-        detail: JSON.stringify({ error: "Erreur: " + e.message }),
+        detail: JSON.stringify({ error: "Error: " + e.message }),
       })
     );
   }
