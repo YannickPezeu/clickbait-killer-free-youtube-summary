@@ -3,7 +3,7 @@
   "name": "Clickbait Killer — Free YouTube Summary",
   "version": "1.0.0",
   "description": "Kill clickbait with AI-powered YouTube video summaries. 100% free & open source.",
-  "permissions": ["storage", "activeTab"],
+  "permissions": ["storage"],
   "host_permissions": [
     "https://www.youtube.com/*",
     "https://api.anthropic.com/*",
